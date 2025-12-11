@@ -1,1 +1,5 @@
 [RunInk 10분 PT 발표 PDF 보기](RunInk_final_10min_pt.pdf)
+
+
+
+![폼보드](image/Runink.png)
