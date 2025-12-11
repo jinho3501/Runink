@@ -1,0 +1,46 @@
+{
+  "project_info": {
+    "project_number": "526543688706",
+    "project_id": "byte-king",
+    "storage_bucket": "byte-king.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:526543688706:android:93fb6288af7af1a48bc31b",
+        "android_client_info": {
+          "package_name": "com.runink.RunInk"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "526543688706-e7nmtr8l4kr3uivlt0086ihmpl32uam9.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD67KXklhXWbKc3B1euxLrTmQ_29FKhcRk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "526543688706-e7nmtr8l4kr3uivlt0086ihmpl32uam9.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "526543688706-18s8an9efal283k2jmv09lhhqqesljel.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.iosTest"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
