@@ -367,11 +367,304 @@ runApp(MyApp(isLoggedIn: isLoggedIn));
 
 ### 자주 받을 후속 질문 대비
 - **"왜 Flutter를 골랐나요?"** → 1 코드베이스로 iOS+Android, 빠른 hot reload, 풍부한 패키지 생태계
-- **"백엔드 코드 보여줄 수 있나요?"** → 팀원이 담당했지만, FastAPI 기반이고 OSM 도로망 매칭 로직이 핵심
+- **"백엔드 코드 보여줄 수 있나요?"** → FastAPI + OSMnx + OpenCV 기반. `Part 2`에서 상세 설명
 - **"앱스토어 출시했나요?"** → MVP 단계로 미출시. 다음 단계로 출시 준비 중
 - **"수익화 모델은 검증됐나요?"** → 배민 장보기 오픈런(24년 6월) 4만 명 1분 컷 사례로 시장 가능성 증명
 
 ---
 
-*Last updated: 2026-05-18*
+# 🐍 Part 2 — 백엔드 알고리즘 Deep Dive
+
+> Flutter 앱이 화려한 UI 레이어라면, 백엔드는 **"이미지를 GPS 경로로 바꾸는"** RunInk의 진짜 두뇌입니다.
+> 풀스택으로 어필할 수 있는 가장 강력한 카드입니다.
+
+## 📐 11. 시스템 풀스택 데이터 플로우
+
+`POST /upload_image` 한 번의 요청이 백엔드에서 일으키는 일:
+
+```
+[Flutter 앱]
+사용자 갤러리에서 이미지 선택
+    │
+    │ HTTP multipart/form-data
+    │ (file + lat + lng + content)
+    ▼
+┌──────────────────────────────────────────────────┐
+│ FastAPI @app.post("/upload_image")               │
+│ main.py:316~388                                  │
+└──────────────────────────────────────────────────┘
+    │
+    │ ① UUID + 타임스탬프로 파일명 생성
+    │    img_20241119_141554_b92e3b3d.png
+    ▼
+┌──────────────────────────────────────────────────┐
+│ AWS S3 업로드 (boto3)                            │
+│ s3_connector.py:upload_img()                     │
+│ → bucket: runink-bucket / region: ap-northeast-2 │
+└──────────────────────────────────────────────────┘
+    │
+    │ ② 업로드된 S3 URL 생성
+    ▼
+┌──────────────────────────────────────────────────┐
+│ img_load_s3.read_image_from_url(url)             │
+│ → requests로 다운로드                            │
+│ → np.asarray + cv2.imdecode로 OpenCV 이미지화    │
+└──────────────────────────────────────────────────┘
+    │
+    │ ③ OpenCV NumPy 배열 (HxWx3 BGR)
+    ▼
+┌──────────────────────────────────────────────────┐
+│ image2course.draw_contour_on_map(image, lat, lon)│
+│ → cv2.Canny(100, 200): 외곽선 추출               │
+│ → cv2.findContours(RETR_EXTERNAL): 윤곽선        │
+│ → max(contours, key=cv2.contourArea): 최대 윤곽  │
+│ → cv2.approxPolyDP(ε=1%): 점 단순화 (수십~수백)  │
+│ → 픽셀 → 위경도 변환                             │
+│   km_per_pixel = size_km(2.5) / max(w,h)         │
+│   lat_step = km_per_pixel / 111                  │
+│   lon_step = km_per_pixel / (111 × cos(lat))     │
+└──────────────────────────────────────────────────┘
+    │
+    │ ④ List[(lat, lon)] — 이미지 외곽 좌표
+    ▼
+┌──────────────────────────────────────────────────┐
+│ rotate_points.rotate_coordinates(coords, 12°)    │
+│ → 기준점(첫 좌표) 기준 12도 시계방향 회전        │
+│ → 위경도 → km 변환 → 2D 회전행렬 → 위경도 환원   │
+│ (도로 방향과 그림 방향 정합)                     │
+└──────────────────────────────────────────────────┘
+    │
+    │ ⑤ 회전된 좌표 리스트
+    ▼
+┌──────────────────────────────────────────────────┐
+│ course_search.get_full_route(coords)             │
+│ → OSMnx로 서울 보행 도로망 graphml 로드          │
+│   data/서울특별시_대한민국_walk.graphml          │
+│ → 각 점 쌍 → ox.distance.nearest_nodes로 매핑    │
+│ → nx.shortest_path(weight='length'): Dijkstra    │
+│ → 마지막 점 → 첫 점 연결 (closed loop)           │
+└──────────────────────────────────────────────────┘
+    │
+    │ ⑥ 실제 도로를 따라가는 전체 경로 + 총 거리(m)
+    ▼
+[Flutter 앱]
+JSON 응답: {"routes":[[{"lat":..,"lng":..}]], "distance":...}
+→ google_maps_flutter Polyline으로 시각화
+→ 사용자가 "운동 시작" 누르면 SelectedRoutePage에서 내비게이션 시작
+```
+
+## 🧠 12. 백엔드 핵심 알고리즘 (코드 인용)
+
+### 🎨 ① 이미지 → 위경도 좌표 변환 (`image2course.py`)
+
+**핵심 아이디어**: OpenCV의 Canny edge + 외곽선 단순화 + 픽셀↔위경도 선형 변환
+
+```python
+# image2course.py:10~62
+def draw_contour_on_map(image, lat_start, lon_start, size_km=2.5, epsilon_factor=0.01):
+    # 1) Canny edge로 외곽선만 추출
+    edges = cv2.Canny(image, 100, 200)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 2) 가장 큰 윤곽 (배경 노이즈 무시)
+    main_contour = max(contours, key=cv2.contourArea)
+
+    # 3) Douglas-Peucker 알고리즘으로 점 단순화 (수천 점 → 수십 점)
+    epsilon = epsilon_factor * cv2.arcLength(main_contour, True)
+    simplified_contour = cv2.approxPolyDP(main_contour, epsilon, True)
+
+    # 4) 픽셀 → km → 위경도 변환
+    x, y, w, h = cv2.boundingRect(simplified_contour)
+    km_per_pixel = size_km / max(w, h)
+    lat_step = km_per_pixel / 111                              # 위도 1° ≈ 111km
+    lon_step = km_per_pixel / (111 * np.cos(np.radians(lat_start)))  # 경도는 위도 보정
+
+    # 5) 좌표 변환 (y축 반전 — 이미지 좌표계는 위가 0, 지리는 위가 큰 위도)
+    coordinates = []
+    for point in simplified_contour:
+        px, py = point[0]
+        lat = lat_start + ((h - (py - y)) * lat_step)
+        lon = lon_start + ((px - x) * lon_step)
+        coordinates.append((lat, lon))
+    return coordinates
+```
+
+**면접 어필 포인트**:
+- **Canny edge detection** + **Douglas-Peucker 단순화** (`cv2.approxPolyDP`) — 수천 픽셀 컨투어를 수십 개로 압축해 다운스트림 그래프 탐색 비용 절감
+- **경도 보정** (`cos(lat)`) — 적도와 극지방의 경도 1°가 다르기 때문에 위도에 따라 보정. 한국(위도 37°)에서는 경도 1°가 약 88km
+- **y축 반전** — OpenCV의 이미지 좌표계(위가 0)와 지리 좌표계(위가 큰 위도)의 방향 차이를 `h - rel_y`로 보정
+
+### 🔄 ② 좌표 회전 변환 (`rotate_points.py`)
+
+**왜 회전이 필요?** → 이미지를 그대로 매핑하면 그림이 정북향(↑)으로 고정. 도로망에 맞춰 회전해야 자연스러운 러닝 경로가 됨.
+
+```python
+# rotate_points.py:3~52
+def rotate_coordinates(coordinates, angle_degrees):
+    base_lat, base_lon = coordinates[0]  # 첫 점이 회전 중심
+    angle_rad = np.radians(angle_degrees)
+
+    # 2D 회전 행렬
+    rotation_matrix = np.array([
+        [np.cos(angle_rad), -np.sin(angle_rad)],
+        [np.sin(angle_rad),  np.cos(angle_rad)]
+    ])
+
+    for lat, lon in coordinates[1:]:
+        # 위경도 → km로 변환 (cos(위도) 보정)
+        lat_diff_km = (lat - base_lat) * 111
+        lon_diff_km = (lon - base_lon) * 111 * np.cos(np.radians(base_lat))
+
+        # 회전행렬 적용
+        rotated = rotation_matrix @ np.array([lon_diff_km, lat_diff_km])
+
+        # km → 위경도 환원
+        new_lat = base_lat + (rotated[1] / 111)
+        new_lon = base_lon + (rotated[0] / (111 * np.cos(np.radians(base_lat))))
+```
+
+**면접 어필 포인트**: 위경도 좌표는 직접 회전하면 안 됨(위도/경도 단위가 다름). **반드시 km 좌표계로 변환 후 회전 → 다시 위경도로 환원**.
+
+### 🗺 ③ 도로망 매칭 + 최단 경로 (`course_search.py`)
+
+**핵심 라이브러리**: OSMnx (OpenStreetMap NetworkX) + NetworkX
+
+```python
+# course_search.py
+import osmnx as ox
+import networkx as nx
+
+# 서울 보행 도로망 그래프 사전 다운로드 (graphml 파일)
+G = ox.load_graphml("data/서울특별시_대한민국_walk.graphml")
+
+def short_route_osm(start_point, end_point):
+    # 위경도 → 가장 가까운 그래프 노드 찾기
+    start_node = ox.distance.nearest_nodes(G, start_lon, start_lat)
+    end_node   = ox.distance.nearest_nodes(G, end_lon, end_lat)
+
+    # Dijkstra 최단 경로 (weight='length' = 미터)
+    route = nx.shortest_path(G, start_node, end_node, weight='length')
+    distance = nx.shortest_path_length(G, start_node, end_node, weight='length')
+
+    route_coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in route]
+    return route_coords, distance
+
+def get_full_route(star_points):
+    full_route = []
+    total_distance = 0
+    for i in range(len(star_points) - 1):  # 점 i → 점 i+1
+        segment, dist = short_route_osm(star_points[i], star_points[i+1])
+        full_route.extend(segment)
+        total_distance += dist
+    # 마지막 → 첫 점 (closed loop)
+    segment, dist = short_route_osm(star_points[-1], star_points[0])
+    full_route.extend(segment)
+    total_distance += dist
+    return full_route, total_distance
+```
+
+**면접 어필 포인트**:
+- **OpenStreetMap을 NetworkX 그래프로 사전 캐싱** (`graphml` 파일) → 매 요청마다 도로망 fetch 안 함, 응답 속도 향상
+- **`ox.distance.nearest_nodes`** — 이미지에서 나온 임의의 위경도 점을 실제 도로 위의 가장 가까운 노드로 스냅
+- **Dijkstra 최단 경로** (`nx.shortest_path`) — 점들을 도로를 따라 자연스럽게 연결
+- **Closed loop 처리** — 마지막 점에서 시작점으로 돌아오는 segment 추가해 출발지에서 출발지로 돌아오는 동선 완성
+
+### 💖 ④ 사전 정의 모양 — 파라메트릭 방정식 (`default_shape.py`)
+
+**Heart 모양** — 진짜 수학적 하트 방정식:
+```python
+# default_shape.py:5~57
+t = np.linspace(0, 2*np.pi, num_points)
+x = 16 * np.sin(t)**3
+y = 13*np.cos(t) - 5*np.cos(2*t) - 2*np.cos(3*t) - np.cos(4*t)
+```
+
+**Star 모양** — 황금비율 적용:
+```python
+# default_shape.py:90~134
+angles = [math.radians(90 + (i * 72)) for i in range(5)]       # 외부 5점
+inner_angles = [math.radians(90 + 36 + (i * 72)) for i in range(5)]  # 내부 5점
+inner_size_km = size_km * 0.382   # 황금비율 (1/φ²)
+```
+
+**면접 어필 포인트**: 단순한 좌표 나열이 아니라 **파라메트릭 방정식**과 **황금비율**을 적용해 시각적으로 자연스러운 모양 생성.
+
+### 🐳 ⑤ Dockerfile + AWS EC2 배포
+
+```dockerfile
+# BackEnd_code/Dockerfile (요지)
+FROM python:3.x-slim
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+- 컨테이너로 EC2에 배포해 환경 일관성 확보
+- 운영 명령: `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8080` (main.py 라인 16)
+
+---
+
+## 🛠 13. 백엔드 기술 스택
+
+| 영역 | 라이브러리 | 활용 |
+|---|---|---|
+| Web 프레임워크 | FastAPI 0.115 + uvicorn 0.32 | 비동기 REST API |
+| 데이터 검증 | pydantic 2.9 | Request/Response 스키마 |
+| **이미지 처리** | **opencv-python 4.10** | Canny edge, findContours, approxPolyDP |
+| **지리공간 그래프** | **osmnx 1.9 + networkx 3.3** | OSM 도로망 + Dijkstra 최단 경로 |
+| 지리공간 데이터 | geopandas 0.14, shapely 2.0, fiona 1.10 | GIS 데이터 처리 |
+| 시각화 | folium 0.18 | 지도 시각화 (디버깅용) |
+| GPS | haversine 2.8 | 위경도 거리 계산 |
+| ML | scikit-learn 1.5, scipy 1.14 | 분석·전처리 |
+| DB | PyMySQL 1.1 | AWS RDS 연결 |
+| AWS | boto3 1.35 | S3 클라이언트 |
+| 배포 | Docker, uvicorn, uvloop | EC2 컨테이너 |
+
+---
+
+## 🎙 14. 백엔드 관련 예상 면접 Q&A
+
+**Q1. "이미지를 어떻게 러닝 경로로 변환하나요? 전체 알고리즘을 설명해주세요."**
+> "5단계로 동작합니다. ① OpenCV의 Canny edge로 외곽선만 추출하고, ② `findContours`로 가장 큰 윤곽을 선택해 배경 노이즈를 제거합니다. ③ Douglas-Peucker 알고리즘(`cv2.approxPolyDP`)으로 수천 점의 컨투어를 수십 개로 단순화해 후속 그래프 탐색 비용을 줄였습니다. ④ 픽셀 좌표를 위경도로 변환할 때 위도 1°≈111km, 경도는 `cos(위도)` 보정을 적용해 한국 위도(37°)에서 1°≈88km로 정확히 계산합니다. ⑤ OSMnx로 사전 캐싱한 서울 보행 도로망 그래프에서 NetworkX의 Dijkstra로 각 점 쌍의 최단 경로를 잇고, 마지막에 시작점으로 돌아오는 closed loop을 만듭니다."
+
+**Q2. "왜 매번 OSM API를 호출하지 않고 graphml로 캐싱했나요?"**
+> "OSM API는 응답 속도가 일정하지 않고 트래픽이 증가하면 rate limit에 걸립니다. 서울 보행 도로망은 한 번 다운로드하면 자주 변하지 않는 데이터라, OSMnx의 `load_graphml`로 메모리에 로드해 매 요청마다 ms 단위로 응답할 수 있게 했습니다. 운영 환경에서는 도시별로 graphml을 미리 받아두고 사용자 위치에 따라 적절한 그래프를 로드하면 확장도 가능합니다."
+
+**Q3. "왜 이미지 좌표를 12도 회전시켰나요?"**
+> "서울 도로망은 정북-정남 방향이 아니라 일정 각도 기울어진 격자 구조가 많습니다. 이미지 윤곽선을 그대로 매핑하면 그림이 정북향으로 고정돼 도로를 따라가지 못하고 비효율적 경로가 나옵니다. 12도 회전은 실험적으로 강남·용산권 도로 방향과 가장 잘 맞는 각도를 찾은 값이고, 향후 위치별로 동적 계산하도록 개선할 수 있습니다."
+
+**Q4. "Heart, Square, Star는 어떻게 자연스럽게 그렸나요?"**
+> "단순 좌표 나열이 아니라 **파라메트릭 방정식**을 썼습니다. Heart는 `x = 16sin³(t)`, `y = 13cos(t) - 5cos(2t) - 2cos(3t) - cos(4t)`라는 진짜 수학적 하트 곡선입니다. Star는 **황금비율(0.382 = 1/φ²)**을 외부/내부 반지름 비율로 적용해 시각적으로 자연스러운 5각 별을 만들었습니다. 사용자 위치가 중심이 되도록 변환했습니다."
+
+**Q5. "FastAPI를 선택한 이유는?"**
+> "비동기 처리(`async/await`)가 표준이고, Pydantic으로 request/response 스키마 검증이 자동입니다. 이미지 업로드는 multipart 처리가 필요한데 FastAPI의 `UploadFile + File()`이 매우 간결합니다. 또 자동 생성되는 OpenAPI 문서가 Flutter 팀과의 API 명세 공유에 유용했습니다. Flask 대비 비동기 + 성능, Django 대비 가벼움이 장점이었습니다."
+
+**Q6. "DB 스키마는 어떻게 설계했나요?"**
+> "`user` 테이블 (user_id, email, pw, name, birthday, gender, profile_image)과 `run` 테이블 (user_id, route_id, distance) 두 축으로 시작했습니다. JOIN으로 사용자별 누적 거리를 집계해 마이페이지 그래프와 랭킹에 활용합니다. MVP 단계라 정규화에 우선을 두고 간단하게 유지했고, 다음 단계로 GPS 아트 작품 테이블, 크루 멤버십 테이블, 좋아요·댓글 테이블을 추가할 계획입니다."
+
+**Q7. "EC2 + RDS + S3 운영 경험이 있군요. 어떤 점이 어려웠나요?"**
+> "RDS 보안 그룹 설정에서 EC2 인스턴스만 허용하도록 IP 제한 거는 부분, S3 CORS 설정으로 Flutter에서 직접 이미지 URL 호출 가능하게 만드는 부분이 처음엔 막혔습니다. 또 Docker로 컨테이너화할 때 OSMnx와 GeoPandas의 의존성(GDAL, fiona 등) 때문에 이미지 크기가 커져 slim 베이스 이미지 + multi-stage build 검토가 필요했습니다."
+
+**Q8. "현재 백엔드 코드에 부족한 부분은?"**
+> "솔직히 말씀드리면, MVP 단계라 demo 흐름을 우선시한 코드가 일부 있습니다. 예를 들어 `main.py`의 `/upload_image`에서 사용자 위치를 받았는데도 용산 좌표(37.557195, 126.976003)로 하드코딩된 부분이 있고(라인 324), `/login` 엔드포인트가 인증 없이 success를 반환합니다(라인 67). 또한 `nx.shortest_path` 매 호출마다 graph 전역을 탐색해 점이 많아지면 O(N × ElogV)로 느려질 수 있어서, A* 알고리즘이나 graph 부분 추출로 최적화 여지가 있습니다."
+
+---
+
+## 🎯 15. 풀스택 어필 포인트 정리
+
+| 영역 | 직접 구현·기여 |
+|---|---|
+| **이미지 처리** | OpenCV Canny edge + Douglas-Peucker로 컨투어 단순화 |
+| **지리공간 알고리즘** | OSMnx + NetworkX Dijkstra로 도로 따라가는 폐곡선 경로 생성 |
+| **수학** | 파라메트릭 곡선 (Heart), 황금비율 (Star), 위경도↔km 변환, 2D 회전행렬 |
+| **API 설계** | FastAPI + Pydantic으로 10+ 엔드포인트 + multipart 이미지 업로드 |
+| **AWS 인프라** | EC2 (서버) + RDS MySQL (DB) + S3 (이미지 스토리지) 통합 운영 |
+| **DevOps** | Dockerfile로 컨테이너화, uvicorn으로 ASGI 운영 |
+| **Flutter ↔ 백엔드** | HTTP multipart, JSON 직렬화, 12개 엔드포인트 통합 |
+
+---
+
+*Last updated: 2026-05-18 (백엔드 분석 추가)*
 *Project repo (local): `/Users/imjinho/StudioProjects/RunInk/`*
+*GitHub: https://github.com/jinho3501/Runink*
