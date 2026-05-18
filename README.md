@@ -286,13 +286,6 @@ docker run -p 8000:8000 --env-file .env runink-api
 
 ---
 
-## 📜 라이선스
-
-본 프로젝트는 LG전자 DX School 1기 교육 과정의 산출물입니다.
-교육·포트폴리오 목적의 참고용으로 자유롭게 열람하실 수 있습니다.
-
----
-
 <p align="center">
   <b>Let's RunInk 🖋️</b><br/>
   <i>당신의 발자국이 곧 작품이 됩니다.</i>
